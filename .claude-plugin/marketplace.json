@@ -1,0 +1,14 @@
+{
+  "name": "caffeinate",
+  "description": "caffeinate: a Claude Code mod that keeps the computer awake while Claude works.",
+  "owner": {
+    "name": "Bruno Reis"
+  },
+  "plugins": [
+    {
+      "name": "caffeinate",
+      "source": "./plugins/caffeinate",
+      "description": "Keeps the computer awake while Claude works: runs caffeinate (or a command of your choice) during turns or for the whole session. Configure with /caffeinate."
+    }
+  ]
+}
