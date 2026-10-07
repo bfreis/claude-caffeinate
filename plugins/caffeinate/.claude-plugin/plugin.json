@@ -1,6 +1,6 @@
 {
   "name": "caffeinate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keeps the computer awake while Claude works: runs caffeinate (or a command of your choice) during turns or for the whole session. Configure with /caffeinate.",
   "author": {
     "name": "Bruno Reis"

@@ -1,7 +1,7 @@
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
 import { atom, read, update } from 'claude-code'
-import { DEFAULTS, FLAGS, MODES, PROGRAMS, commandFor, normalize, shouldHold } from './settings.js'
-import type { Settings } from './settings.js'
+import { DEFAULTS, FLAGS, MODES, NOTHING_PENDING, PROGRAMS, SCHEDULED, commandFor, holdReason, normalize } from './settings.js'
+import type { Pending, Settings } from './settings.js'
 
 const PANE = 'caffeinate'
 const STORE_KEY = 'settings'
@@ -9,12 +9,15 @@ const STORE_KEY = 'settings'
 const REFRESH_MS = 15_000
 
 // What the pane draws: the settings and what this session is doing about them
-type View = { settings: Settings; holding: string | undefined; problem: string | undefined }
-const view = atom({ plugin: 'caffeinate', key: 'view' } as const, { settings: DEFAULTS, holding: undefined, problem: undefined } as View)
+type View = { settings: Settings; holding: string | undefined; reason: string | undefined; problem: string | undefined }
+const view = atom({ plugin: 'caffeinate', key: 'view' } as const, { settings: DEFAULTS, holding: undefined, reason: undefined, problem: undefined } as View)
 
 // Module variables: a reload kills the child anyway, so these start over with it
 let settings: Settings = DEFAULTS
 let turnId: string | undefined
+// What the last turn left running, from its Stop. An interrupted turn raises no Stop, so this stays as last reported
+let pending: Pending = NOTHING_PENDING
+let reason: string | undefined
 let child: { key: string; label: string; stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> } | undefined
 let problem: string | undefined
 
@@ -29,9 +32,10 @@ async function saveSettings($: EngineInterface, change: Partial<Settings>): Prom
   await sync($)
 }
 
-// Starts, swaps or stops the child so it matches the settings and whether a turn is running
+// Starts, swaps or stops the child so it matches the settings, whether a turn is running and what it left pending
 async function sync($: EngineInterface): Promise<void> {
-  const want = shouldHold(settings, turnId !== undefined) ? commandFor(settings) : undefined
+  reason = holdReason(settings, turnId !== undefined, pending)
+  const want = reason ? commandFor(settings) : undefined
   const key = want && 'argv' in want ? JSON.stringify(want.argv) : undefined
   if (child && child.key !== key) {
     const old = child
@@ -74,9 +78,9 @@ function start($: EngineInterface, argv: string[]): void {
 
 async function show($: EngineInterface): Promise<void> {
   if (problem) $.ui.status('☕ not keeping awake: ' + problem)
-  else if (child) $.ui.status('☕ keeping awake')
+  else if (child) $.ui.status('☕ keeping awake: ' + reason)
   else $.ui.status(undefined)
-  const snapshot: View = { settings, holding: child?.label, problem }
+  const snapshot: View = { settings, holding: child?.label, reason, problem }
   await update($, view, () => snapshot)
 }
 
@@ -88,7 +92,7 @@ export const register: Register = (on) => {
     $.clock.every(REFRESH_MS, async () => {
       const fresh = normalize(await $.store.get(STORE_KEY))
       // Also retries a child that died, e.g. a custom command that failed to start
-      if (JSON.stringify(fresh) !== JSON.stringify(settings) || (!child && shouldHold(fresh, turnId !== undefined))) {
+      if (JSON.stringify(fresh) !== JSON.stringify(settings) || (!child && holdReason(fresh, turnId !== undefined, pending))) {
         settings = fresh
         await sync($)
       }
@@ -106,6 +110,12 @@ export const register: Register = (on) => {
     turnId = e.turnId
     settings = normalize(await $.store.get(STORE_KEY))
     await sync($)
+    return next(e)
+  })
+
+  // Fires at the end of a main-loop turn, just before turn.complete (not on an interrupt): what is left running or scheduled
+  on('classic.Stop', async ($, e, next) => {
+    pending = { background: e.background_tasks?.length ?? 0, scheduled: e.session_crons?.length ?? 0 }
     return next(e)
   })
 
@@ -132,7 +142,7 @@ export const register: Register = (on) => {
     const state = v.problem
       ? Text({ color: 'warning', children: ['Not keeping awake: ' + v.problem] })
       : v.holding
-        ? Text({ color: 'success', children: ['Keeping awake: ' + v.holding] })
+        ? Text({ color: 'success', children: ['Keeping awake (' + v.reason + '): ' + v.holding] })
         : Text({ dimColor: true, children: [s.mode === 'off' ? 'Off' : 'Idle: starts with the next turn'] })
     const save = (change: Partial<Settings>) => void saveSettings($, change)
     return Box({
@@ -141,6 +151,18 @@ export const register: Register = (on) => {
       children: [
         state,
         Select({ key: 'mode', label: 'Keep awake', options: MODES, value: s.mode, onSelect: (value) => save({ mode: value as Settings['mode'] }) }),
+        s.mode === 'turn'
+          ? Text({ dimColor: true, children: ['Includes background work a turn leaves running (monitors, background shells and agents).'] })
+          : undefined,
+        s.mode === 'turn'
+          ? Select({
+              key: 'scheduled',
+              label: 'Scheduled wake-ups (/loop, ScheduleWakeup, cron)',
+              options: SCHEDULED,
+              value: s.scheduled ? 'on' : 'off',
+              onSelect: (value) => save({ scheduled: value === 'on' }),
+            })
+          : undefined,
         Select({ key: 'program', label: 'Using', options: PROGRAMS, value: s.program, onSelect: (value) => save({ program: value as Settings['program'] }) }),
         s.program === 'caffeinate'
           ? Select({ key: 'flags', label: 'Flags', options: FLAGS, value: s.flags, onSelect: (value) => save({ flags: value }) })

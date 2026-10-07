@@ -33,6 +33,7 @@ function harness(on: any, saved: Record<string, unknown> = {}, heartbeat = true)
   on('session.start', () => ({ cwd: '/work' }))
   on('turn.start', ($: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  on('classic.Stop', () => ({}))
   // It wakes every few ms with a heartbeat, so a stop from the mod (return() on its stream) reaches the finally
   on('process.spawn', async function* ($: unknown, e: { argv: readonly string[] }) {
     let end: { code: number; text: string } | undefined
@@ -54,6 +55,17 @@ function harness(on: any, saved: Record<string, unknown> = {}, heartbeat = true)
   return { children, running, status, store, clock }
 }
 
+// What Claude Code reports at the end of a main-loop turn (it raises Stop just before turn.complete)
+const endTurn = async ($: any, turnId: string, left: { background?: number; crons?: number } = {}) => {
+  await $.classic.Stop({
+    session_id: 's', transcript_path: '/t', cwd: '/work', hook_event_name: 'Stop', stop_hook_active: false,
+    background_tasks: Array.from({ length: left.background ?? 0 }, (_, i) => ({ id: 'b' + i, type: 'shell', status: 'running', description: 'watch' })),
+    session_crons: Array.from({ length: left.crons ?? 0 }, (_, i) => ({ id: 'c' + i, schedule: '0 9 * * *', recurring: false, prompt: 'hi' })),
+  })
+  await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId, reason: 'answer' })
+  await settle()
+}
+
 const start = ($: any) => $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
 const settle = () => new Promise((r) => setTimeout(r, 20))
 
@@ -65,17 +77,62 @@ test('by default it keeps awake only while a turn runs', async ($, on) => {
 
   await $.turn.start({ text: 'hi', turnId: 't1' })
   expect(h.running()).toEqual(['caffeinate -i'])
-  expect(h.status()).toBe('☕ keeping awake')
+  expect(h.status()).toBe('☕ keeping awake: Claude is working')
 
   // A subagent's turn ending is not the main turn ending
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', agentId: 'a1', reason: 'answer' })
   await settle()
   expect(h.running()).toEqual(['caffeinate -i'])
 
-  await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
-  await settle()
+  await endTurn($, 't1')
   expect(h.running()).toEqual([])
   expect(h.status()).toBeUndefined()
+})
+
+test('background work a turn leaves running keeps it awake until a turn ends with none', async ($, on) => {
+  const h = harness(on)
+  await start($)
+  await $.turn.start({ text: 'watch the build', turnId: 't1' })
+  await endTurn($, 't1', { background: 1 })
+  expect(h.running()).toEqual(['caffeinate -i'])
+  expect(h.status()).toBe('☕ keeping awake: 1 background task running')
+
+  // The monitor's notification starts a turn; it ends with nothing left running
+  await $.turn.start({ text: '', turnId: 't2' })
+  expect(h.children.length).toBe(1)
+  await endTurn($, 't2')
+  expect(h.running()).toEqual([])
+  expect(h.status()).toBeUndefined()
+})
+
+test('an interrupted turn (no Stop) keeps what the last Stop reported', async ($, on) => {
+  const h = harness(on)
+  await start($)
+  await $.turn.start({ text: 'watch', turnId: 't1' })
+  await endTurn($, 't1', { background: 1 })
+  await $.turn.start({ text: 'more', turnId: 't2' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' })
+  await settle()
+  expect(h.running()).toEqual(['caffeinate -i'])
+})
+
+test('scheduled wake-ups keep it awake by default, and not once that setting is off', async ($, on) => {
+  const h = harness(on)
+  await start($)
+  await $.turn.start({ text: 'loop', turnId: 't1' })
+  await endTurn($, 't1', { crons: 1 })
+  expect(h.running()).toEqual(['caffeinate -i'])
+  expect(h.status()).toBe('☕ keeping awake: a scheduled wake-up is pending')
+
+  // The wake-up fired and nothing else is scheduled
+  await $.turn.start({ text: 'hi', turnId: 't2' })
+  await endTurn($, 't2')
+  expect(h.running()).toEqual([])
+
+  h.store.set('settings', { mode: 'turn', scheduled: false, program: 'caffeinate', flags: '-i', custom: '' })
+  await $.turn.start({ text: 'loop', turnId: 't3' })
+  await endTurn($, 't3', { crons: 1 })
+  expect(h.running()).toEqual([])
 })
 
 test('an interrupted turn releases too', async ($, on) => {
@@ -92,8 +149,7 @@ test('session mode holds from the start, and off never holds', async ($, on) => 
   await start($)
   expect(h.running()).toEqual(['caffeinate -di'])
   await $.turn.start({ text: 'hi', turnId: 't1' })
-  await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
-  await settle()
+  await endTurn($, 't1')
   expect(h.running()).toEqual(['caffeinate -di'])
 })
 
@@ -124,7 +180,7 @@ test('a child that exits on its own is reported, not silently lost', async ($, o
   await h.clock.advance(15_000)
   await settle()
   expect(h.children.map((c) => c.argv.join(' '))).toEqual(['nope', 'nope'])
-  expect(h.status()).toBe('☕ keeping awake')
+  expect(h.status()).toBe('☕ keeping awake: Claude is working')
 })
 
 // ui.find waits for spawn streams to go quiet, so these children never write and this test reads what was started
@@ -138,16 +194,23 @@ test('the pane changes settings, saves them, and applies them at once', async ($
     await ui.unmount()
   }
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.select({ key: 'scheduled', value: 'off' })
+  await settle()
+  expect(h.store.get('settings')).toEqual({ mode: 'turn', scheduled: false, program: 'caffeinate', flags: '-i', custom: '' })
+  await ui.select({ key: 'scheduled', value: 'on' })
+  await settle()
   await ui.select({ key: 'mode', value: 'session' })
   await settle()
-  expect(h.store.get('settings')).toEqual({ mode: 'session', program: 'caffeinate', flags: '-i', custom: '' })
+  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'caffeinate', flags: '-i', custom: '' })
+  // The scheduled wake-ups control applies to turn mode only
+  expect(await ui.find({ type: 'Select', key: 'scheduled' })).toBeUndefined()
   expect(started()).toEqual(['caffeinate -i'])
-  expect(await ui.find({ type: 'Text', text: 'Keeping awake: caffeinate -i' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Keeping awake (for the session): caffeinate -i' })).toBeDefined()
 
   await ui.select({ key: 'flags', value: '-s' })
   await settle()
   expect(started()).toEqual(['caffeinate -i', 'caffeinate -s'])
-  expect(await ui.find({ type: 'Text', text: 'Keeping awake: caffeinate -s' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Keeping awake (for the session): caffeinate -s' })).toBeDefined()
 
   await ui.select({ key: 'program', value: 'custom' })
   await settle()
@@ -157,7 +220,7 @@ test('the pane changes settings, saves them, and applies them at once', async ($
   await ui.input({ key: 'custom', text: '  my-inhibit --forever ' })
   await settle()
   expect(started()[2]).toBe('my-inhibit --forever')
-  expect(h.store.get('settings')).toEqual({ mode: 'session', program: 'custom', flags: '-s', custom: 'my-inhibit --forever' })
+  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'custom', flags: '-s', custom: 'my-inhibit --forever' })
   await ui.unmount()
 })
 

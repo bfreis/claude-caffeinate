@@ -5,17 +5,29 @@ export type Program = 'caffeinate' | 'custom'
 
 export type Settings = {
   mode: Mode
+  // Turn mode: also stay awake while a scheduled wake-up (CronCreate, ScheduleWakeup, /loop) is pending
+  scheduled: boolean
   program: Program
   flags: string
   custom: string
 }
 
-export const DEFAULTS: Settings = { mode: 'turn', program: 'caffeinate', flags: '-i', custom: '' }
+export const DEFAULTS: Settings = { mode: 'turn', scheduled: true, program: 'caffeinate', flags: '-i', custom: '' }
+
+// What the session still has going after a turn ends, as the last Stop reported it
+export type Pending = { background: number; scheduled: number }
+
+export const NOTHING_PENDING: Pending = { background: 0, scheduled: 0 }
 
 export const MODES: readonly { value: Mode; label: string }[] = [
   { value: 'turn', label: 'While Claude is working on a turn' },
   { value: 'session', label: 'For the whole session' },
   { value: 'off', label: 'Off' },
+]
+
+export const SCHEDULED: readonly { value: 'off' | 'on'; label: string }[] = [
+  { value: 'on', label: 'Stay awake for them' },
+  { value: 'off', label: 'Let it sleep until then' },
 ]
 
 export const PROGRAMS: readonly { value: Program; label: string }[] = [
@@ -37,6 +49,7 @@ export function normalize(raw: unknown): Settings {
     allowed.some((o) => o.value === x) ? (x as T) : d
   return {
     mode: pick(v.mode, MODES, DEFAULTS.mode),
+    scheduled: typeof v.scheduled === 'boolean' ? v.scheduled : DEFAULTS.scheduled,
     program: pick(v.program, PROGRAMS, DEFAULTS.program),
     flags: pick(v.flags, FLAGS, DEFAULTS.flags),
     custom: typeof v.custom === 'string' ? v.custom : DEFAULTS.custom,
@@ -91,6 +104,12 @@ export function commandFor(s: Settings): { argv: string[] } | { error: string } 
   return argv.length ? { argv } : { error: 'no custom command set' }
 }
 
-export function shouldHold(s: Settings, isTurnRunning: boolean): boolean {
-  return s.mode === 'session' || (s.mode === 'turn' && isTurnRunning)
+// Why the machine should stay awake right now, or undefined when it may sleep
+export function holdReason(s: Settings, isTurnRunning: boolean, pending: Pending): string | undefined {
+  if (s.mode === 'session') return 'for the session'
+  if (s.mode === 'off') return undefined
+  if (isTurnRunning) return 'Claude is working'
+  if (pending.background > 0) return pending.background === 1 ? '1 background task running' : pending.background + ' background tasks running'
+  if (s.scheduled && pending.scheduled > 0) return pending.scheduled === 1 ? 'a scheduled wake-up is pending' : pending.scheduled + ' scheduled wake-ups are pending'
+  return undefined
 }

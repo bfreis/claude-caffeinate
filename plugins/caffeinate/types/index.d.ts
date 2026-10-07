@@ -3,8 +3,9 @@ declare module 'claude-code' {
   interface PluginState {
     caffeinate: {
       view: {
-        settings: { mode: 'turn' | 'session' | 'off'; program: 'caffeinate' | 'custom'; flags: string; custom: string }
+        settings: { mode: 'turn' | 'session' | 'off'; scheduled: boolean; program: 'caffeinate' | 'custom'; flags: string; custom: string }
         holding: string | undefined
+        reason: string | undefined
         problem: string | undefined
       }
     }
