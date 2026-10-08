@@ -1,6 +1,6 @@
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
 import { atom, read, update } from 'claude-code'
-import { DEFAULTS, FLAGS, MODES, NOTHING_PENDING, PROGRAMS, SCHEDULED, commandFor, holdReason, normalize } from './settings.js'
+import { DEFAULTS, FLAGS, LID, MODES, NOTHING_PENDING, PROGRAMS, SCHEDULED, commandFor, holdReason, normalize } from './settings.js'
 import type { Pending, Settings } from './settings.js'
 
 const PANE = 'caffeinate'
@@ -8,9 +8,23 @@ const STORE_KEY = 'settings'
 // Another session may change the settings; each session picks that up within this long
 const REFRESH_MS = 15_000
 
+// The lid helper (lid/): a root LaunchDaemon, installed once with an admin prompt, that keeps the Mac awake with the
+// lid closed while a process holds it. 'busy' is an install or uninstall waiting on that prompt.
+type LidState = 'unknown' | 'unsupported' | 'missing' | 'outdated' | 'installed' | 'busy'
+
 // What the pane draws: the settings and what this session is doing about them
-type View = { settings: Settings; holding: string | undefined; reason: string | undefined; problem: string | undefined }
-const view = atom({ plugin: 'caffeinate', key: 'view' } as const, { settings: DEFAULTS, holding: undefined, reason: undefined, problem: undefined } as View)
+type View = {
+  settings: Settings
+  lid: LidState
+  lidMessage: string | undefined
+  holding: string | undefined
+  reason: string | undefined
+  problem: string | undefined
+}
+const view = atom(
+  { plugin: 'caffeinate', key: 'view' } as const,
+  { settings: DEFAULTS, lid: 'unknown', lidMessage: undefined, holding: undefined, reason: undefined, problem: undefined } as View,
+)
 
 // Module variables: a reload kills the child anyway, so these start over with it
 let settings: Settings = DEFAULTS
@@ -20,6 +34,9 @@ let pending: Pending = NOTHING_PENDING
 let reason: string | undefined
 let child: { key: string; label: string; stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> } | undefined
 let problem: string | undefined
+let lid: LidState = 'unknown'
+// The last lid helper error, shown in the pane
+let lidMessage: string | undefined
 
 async function loadSettings($: EngineInterface): Promise<void> {
   settings = normalize(await $.store.get(STORE_KEY))
@@ -35,7 +52,7 @@ async function saveSettings($: EngineInterface, change: Partial<Settings>): Prom
 // Starts, swaps or stops the child so it matches the settings, whether a turn is running and what it left pending
 async function sync($: EngineInterface): Promise<void> {
   reason = holdReason(settings, turnId !== undefined, pending)
-  const want = reason ? commandFor(settings) : undefined
+  const want = reason ? commandFor(settings, $.plugin.root + '/lid/hold.sh') : undefined
   const key = want && 'argv' in want ? JSON.stringify(want.argv) : undefined
   if (child && child.key !== key) {
     const old = child
@@ -50,7 +67,9 @@ async function sync($: EngineInterface): Promise<void> {
 
 function start($: EngineInterface, argv: string[]): void {
   const stream = $.process.spawn({ argv })
-  const mine = { key: JSON.stringify(argv), label: argv.join(' '), stream }
+  // Through the lid helper's hold script, name the command it runs rather than the script
+  const shown = argv[0] === '/bin/sh' && argv[1] === $.plugin.root + '/lid/hold.sh' ? argv.slice(2) : argv
+  const mine = { key: JSON.stringify(argv), label: shown.join(' ') + (shown === argv ? '' : ' (lid closed too)'), stream }
   child = mine
   problem = undefined
   void (async () => {
@@ -71,23 +90,110 @@ function start($: EngineInterface, argv: string[]): void {
     // Stopped on purpose (sync replaced it, or the module unloaded): nothing to report
     if (child !== mine) return
     child = undefined
-    problem = argv[0] + ' ' + ended + (said.trim() ? ': ' + said.trim().split('\n').pop() : '')
+    problem = shown[0] + ' ' + ended + (said.trim() ? ': ' + said.trim().split('\n').pop() : '')
     await show($)
   })()
 }
 
 async function show($: EngineInterface): Promise<void> {
+  // Never blocks the normal hold: a lid helper that is not ready only adds a note
+  const lidNote = !settings.lid ? '' : lid === 'missing' ? ' (lid helper not installed: /caffeinate)' : lid === 'outdated' ? ' (lid helper needs an update: /caffeinate)' : ''
   if (problem) $.ui.status('☕ not keeping awake: ' + problem)
-  else if (child) $.ui.status('☕ keeping awake: ' + reason)
+  else if (child) $.ui.status('☕ keeping awake: ' + reason + lidNote)
   else $.ui.status(undefined)
-  const snapshot: View = { settings, holding: child?.label, reason, problem }
+  const snapshot: View = { settings, lid, lidMessage, holding: child?.label, reason, problem }
   await update($, view, () => snapshot)
 }
+
+// Asks the helper's check script, which needs no privileges, whether the helper is installed and current
+async function checkLid($: EngineInterface): Promise<void> {
+  if (lid === 'busy') return
+  try {
+    const { exitCode } = await $.process.run(['/bin/sh', $.plugin.root + '/lid/check.sh'])
+    lid = exitCode === 0 ? 'installed' : exitCode === 1 ? 'missing' : exitCode === 2 ? 'outdated' : 'unsupported'
+  } catch {
+    lid = 'unsupported'
+  }
+  await show($)
+}
+
+// Runs a lid script as root through the macOS admin prompt. Returns an error message, or undefined on success.
+async function runAdmin($: EngineInterface, script: string, prompt: string): Promise<string | undefined> {
+  try {
+    const user = (await $.process.run(['id', '-un'])).stdout.trim()
+    const r = await $.process.run(
+      [
+        '/usr/bin/osascript',
+        '-e', 'on run argv',
+        '-e', 'do shell script "/bin/sh " & quoted form of (item 1 of argv) & " " & quoted form of (item 2 of argv) with prompt "' + prompt + '" with administrator privileges',
+        '-e', 'end run',
+        $.plugin.root + '/lid/' + script,
+        user,
+      ],
+      { timeoutMs: 600_000 },
+    )
+    if (r.exitCode === 0) return undefined
+    if (r.stderr.includes('-128')) return 'cancelled'
+    return r.stderr.trim().split('\n').pop() || 'exited with code ' + r.exitCode
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
+}
+
+// Installs or updates the helper. Only ever called for an explicit action in the pane: it raises the admin prompt.
+async function installLid($: EngineInterface): Promise<boolean> {
+  const before = lid
+  lid = 'busy'
+  lidMessage = undefined
+  await show($)
+  const failed = await runAdmin($, 'install.sh', 'caffeinate wants to install a helper that keeps your Mac awake with the lid closed.')
+  lid = before
+  if (failed) lidMessage = 'Could not install the lid helper: ' + failed
+  await checkLid($)
+  return !failed && lid === 'installed'
+}
+
+async function uninstallLid($: EngineInterface): Promise<void> {
+  const before = lid
+  lid = 'busy'
+  lidMessage = undefined
+  await show($)
+  const failed = await runAdmin($, 'uninstall.sh', 'caffeinate wants to remove the helper that keeps your Mac awake with the lid closed.')
+  lid = before
+  if (failed) lidMessage = 'Could not uninstall the lid helper: ' + failed
+  await checkLid($)
+  if (!failed) await saveSettings($, { lid: false })
+}
+
+// Turning it on asks for admin only when the helper is missing or outdated. Turning it off touches nothing, so the
+// idle helper stays and turning it on again never asks.
+async function setLid($: EngineInterface, on: boolean): Promise<void> {
+  if (!on) {
+    lidMessage = undefined
+    await saveSettings($, { lid: false })
+    return
+  }
+  if (lid === 'busy') return
+  if (lid === 'unknown') await checkLid($)
+  lidMessage = undefined
+  if (lid === 'unsupported') {
+    lidMessage = 'Only on macOS'
+    await show($)
+    return
+  }
+  if ((lid === 'missing' || lid === 'outdated') && !(await installLid($))) return
+  if (lid === 'installed') await saveSettings($, { lid: true })
+}
+
+// The install button shows when the helper is outdated, or wanted and not there
+const needsInstall = (v: View): boolean => v.lid === 'outdated' || (v.settings.lid && v.lid === 'missing')
 
 export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await loadSettings($)
+    // Only when asked for: the check is cheap, but a setting that is off should cost nothing
+    if (settings.lid) await checkLid($)
     await sync($)
     $.clock.every(REFRESH_MS, async () => {
       const fresh = normalize(await $.store.get(STORE_KEY))
@@ -128,6 +234,7 @@ export const register: Register = (on) => {
   })
 
   on('command.run', { command: 'caffeinate' }, async ($) => {
+    await checkLid($)
     await $.ui.open({ id: PANE, title: 'caffeinate', focus: true, closeOnEscape: true })
     return {}
   })
@@ -144,6 +251,7 @@ export const register: Register = (on) => {
       : v.holding
         ? Text({ color: 'success', children: ['Keeping awake (' + v.reason + '): ' + v.holding] })
         : Text({ dimColor: true, children: [s.mode === 'off' ? 'Off' : 'Idle: starts with the next turn'] })
+    const wantsInstall = needsInstall(v)
     const save = (change: Partial<Settings>) => void saveSettings($, change)
     return Box({
       flexDirection: 'column',
@@ -176,6 +284,18 @@ export const register: Register = (on) => {
             }),
         s.program === 'custom'
           ? Text({ dimColor: true, children: ['Runs while awake is wanted and is stopped after. Quotes work; no shell (no pipes or &&).'] })
+          : undefined,
+        Select({ key: 'lid', label: 'Lid closed', options: LID, value: s.lid ? 'on' : 'off', onSelect: (value) => void setLid($, value === 'on') }),
+        v.lidMessage ? Text({ color: 'warning', children: [v.lidMessage] }) : undefined,
+        v.lid === 'busy' ? Text({ dimColor: true, children: ['Waiting for the lid helper: answer the admin prompt.'] }) : undefined,
+        s.lid
+          ? Text({ dimColor: true, children: ["The lid can close while awake is held. If it's ever stuck awake: sudo pmset -a disablesleep 0"] })
+          : undefined,
+        wantsInstall
+          ? Button({ key: 'lid-install', label: 'Install/Update lid helper', onPress: () => void installLid($) })
+          : undefined,
+        v.lid === 'installed'
+          ? Button({ key: 'lid-uninstall', label: 'Uninstall lid helper', onPress: () => void uninstallLid($) })
           : undefined,
         Text({ dimColor: true, children: ['Saved for every session on this machine. Esc closes.'] }),
         Button({ key: 'close', label: 'Close', role: 'dismiss', onPress: () => void $.ui.close({ id: PANE }) }),

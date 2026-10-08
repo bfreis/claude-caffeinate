@@ -13,10 +13,10 @@ test('splitCommand splits words, quotes and backslashes without a shell', async 
 test('normalize keeps valid fields and drops the rest', async () => {
   expect(normalize(undefined)).toEqual(DEFAULTS)
   expect(normalize('junk')).toEqual(DEFAULTS)
-  expect(normalize({ mode: 'session', scheduled: true, program: 'custom', flags: '-di', custom: 'x y' })).toEqual({
-    mode: 'session', scheduled: true, program: 'custom', flags: '-di', custom: 'x y',
+  expect(normalize({ mode: 'session', scheduled: true, program: 'custom', flags: '-di', custom: 'x y', lid: true })).toEqual({
+    mode: 'session', scheduled: true, program: 'custom', flags: '-di', custom: 'x y', lid: true,
   })
-  expect(normalize({ mode: 'always', scheduled: 'yes', program: 'rm', flags: '-rf', custom: 3 })).toEqual(DEFAULTS)
+  expect(normalize({ mode: 'always', scheduled: 'yes', program: 'rm', flags: '-rf', custom: 3, lid: 'yes' })).toEqual(DEFAULTS)
   // Settings saved before `scheduled` existed keep working
   expect(normalize({ mode: 'turn', program: 'caffeinate', flags: '-s', custom: '' })).toEqual({ ...DEFAULTS, flags: '-s' })
 })
@@ -29,6 +29,17 @@ test('commandFor builds caffeinate with its flags, or the custom command', async
   })
   expect(commandFor({ ...DEFAULTS, program: 'custom', custom: '   ' })).toEqual({ error: 'no custom command set' })
   expect(commandFor({ ...DEFAULTS, program: 'custom', custom: `x 'y` })).toEqual({ error: "custom command: unclosed ' quote" })
+})
+
+test('commandFor wraps the command with the hold script only when the lid setting is on', async () => {
+  const hold = '/p/lid/hold.sh'
+  expect(commandFor(DEFAULTS, hold)).toEqual({ argv: ['caffeinate', '-i'] })
+  expect(commandFor({ ...DEFAULTS, lid: true })).toEqual({ argv: ['caffeinate', '-i'] })
+  expect(commandFor({ ...DEFAULTS, lid: true }, hold)).toEqual({ argv: ['/bin/sh', hold, 'caffeinate', '-i'] })
+  expect(commandFor({ ...DEFAULTS, lid: true, program: 'custom', custom: 'my-inhibit "a b"' }, hold)).toEqual({
+    argv: ['/bin/sh', hold, 'my-inhibit', 'a b'],
+  })
+  expect(commandFor({ ...DEFAULTS, lid: true, program: 'custom', custom: '' }, hold)).toEqual({ error: 'no custom command set' })
 })
 
 test('holdReason follows the mode, the turn and what it left pending', async () => {

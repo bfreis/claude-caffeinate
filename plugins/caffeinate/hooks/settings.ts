@@ -10,9 +10,11 @@ export type Settings = {
   program: Program
   flags: string
   custom: string
+  // macOS: also keep the Mac awake with the lid closed, through the lid helper (see lid/)
+  lid: boolean
 }
 
-export const DEFAULTS: Settings = { mode: 'turn', scheduled: true, program: 'caffeinate', flags: '-i', custom: '' }
+export const DEFAULTS: Settings = { mode: 'turn', scheduled: true, program: 'caffeinate', flags: '-i', custom: '', lid: false }
 
 // What the session still has going after a turn ends, as the last Stop reported it
 export type Pending = { background: number; scheduled: number }
@@ -28,6 +30,11 @@ export const MODES: readonly { value: Mode; label: string }[] = [
 export const SCHEDULED: readonly { value: 'off' | 'on'; label: string }[] = [
   { value: 'on', label: 'Stay awake for them' },
   { value: 'off', label: 'Let it sleep until then' },
+]
+
+export const LID: readonly { value: 'off' | 'on'; label: string }[] = [
+  { value: 'off', label: 'Sleep as usual' },
+  { value: 'on', label: 'Stay awake with the lid closed (macOS; one-time admin install)' },
 ]
 
 export const PROGRAMS: readonly { value: Program; label: string }[] = [
@@ -53,6 +60,7 @@ export function normalize(raw: unknown): Settings {
     program: pick(v.program, PROGRAMS, DEFAULTS.program),
     flags: pick(v.flags, FLAGS, DEFAULTS.flags),
     custom: typeof v.custom === 'string' ? v.custom : DEFAULTS.custom,
+    lid: typeof v.lid === 'boolean' ? v.lid : DEFAULTS.lid,
   }
 }
 
@@ -92,16 +100,18 @@ export function splitCommand(line: string): string[] {
   return out
 }
 
-// The command that keeps the machine awake, or a reason there is none.
-export function commandFor(s: Settings): { argv: string[] } | { error: string } {
-  if (s.program === 'caffeinate') return { argv: ['caffeinate', s.flags] }
+// The command that keeps the machine awake, or a reason there is none. With the lid setting on and a hold script,
+// the command runs through it (it registers the process with the lid helper, then execs the command).
+export function commandFor(s: Settings, holdScript?: string): { argv: string[] } | { error: string } {
+  const wrap = (argv: string[]) => ({ argv: s.lid && holdScript ? ['/bin/sh', holdScript, ...argv] : argv })
+  if (s.program === 'caffeinate') return wrap(['caffeinate', s.flags])
   let argv: string[]
   try {
     argv = splitCommand(s.custom)
   } catch (err) {
     return { error: 'custom command: ' + (err instanceof Error ? err.message : String(err)) }
   }
-  return argv.length ? { argv } : { error: 'no custom command set' }
+  return argv.length ? wrap(argv) : { error: 'no custom command set' }
 }
 
 // Why the machine should stay awake right now, or undefined when it may sleep

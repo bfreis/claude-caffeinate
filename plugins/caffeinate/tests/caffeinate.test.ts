@@ -50,9 +50,25 @@ function harness(on: any, saved: Record<string, unknown> = {}, heartbeat = true)
       child.isRunning = false
     }
   })
+  // The lid helper's scripts, answered by `lidExit` (what check.sh says) and `adminExit` (what the osascript run does)
+  const runs: string[][] = []
+  const lid = { check: 1, admin: { exitCode: 0, stderr: '' } }
+  on('process.run', ($: unknown, e: { argv: readonly string[] }) => {
+    runs.push([...e.argv])
+    const out = (exitCode: number, stdout = '', stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv[0] === 'id') return out(0, 'bruno\n')
+    if (e.argv[0] === '/usr/bin/osascript') {
+      // A good install makes the next check say installed
+      if (lid.admin.exitCode === 0) lid.check = e.argv.some((a) => a.endsWith('uninstall.sh')) ? 1 : 0
+      return out(lid.admin.exitCode, '', lid.admin.stderr)
+    }
+    return out(lid.check)
+  })
+  const checks = () => runs.filter((r) => r[1]?.endsWith('/lid/check.sh')).length
+  const admins = () => runs.filter((r) => r[0] === '/usr/bin/osascript').length
   const running = () => children.filter((c) => c.isRunning).map((c) => c.argv.join(' '))
   const status = () => statuses[statuses.length - 1]
-  return { children, running, status, store, clock }
+  return { children, running, status, store, clock, lid, runs, checks, admins }
 }
 
 // What Claude Code reports at the end of a main-loop turn (it raises Stop just before turn.complete)
@@ -196,12 +212,12 @@ test('the pane changes settings, saves them, and applies them at once', async ($
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.select({ key: 'scheduled', value: 'off' })
   await settle()
-  expect(h.store.get('settings')).toEqual({ mode: 'turn', scheduled: false, program: 'caffeinate', flags: '-i', custom: '' })
+  expect(h.store.get('settings')).toEqual({ mode: 'turn', scheduled: false, program: 'caffeinate', flags: '-i', custom: '', lid: false })
   await ui.select({ key: 'scheduled', value: 'on' })
   await settle()
   await ui.select({ key: 'mode', value: 'session' })
   await settle()
-  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'caffeinate', flags: '-i', custom: '' })
+  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'caffeinate', flags: '-i', custom: '', lid: false })
   // The scheduled wake-ups control applies to turn mode only
   expect(await ui.find({ type: 'Select', key: 'scheduled' })).toBeUndefined()
   expect(started()).toEqual(['caffeinate -i'])
@@ -220,7 +236,7 @@ test('the pane changes settings, saves them, and applies them at once', async ($
   await ui.input({ key: 'custom', text: '  my-inhibit --forever ' })
   await settle()
   expect(started()[2]).toBe('my-inhibit --forever')
-  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'custom', flags: '-s', custom: 'my-inhibit --forever' })
+  expect(h.store.get('settings')).toEqual({ mode: 'session', scheduled: true, program: 'custom', flags: '-s', custom: 'my-inhibit --forever', lid: false })
   await ui.unmount()
 })
 
@@ -229,4 +245,89 @@ test('/caffeinate opens the pane without printing anything', async ($, on) => {
   await start($)
   const answer = await $.command.run({ command: 'caffeinate', args: '', ...typed })
   expect(answer).toEqual({})
+})
+
+const lidPane = async ($: any) => {
+  await start($)
+  return $.ui.mount({ ...PANE, surface: 'terminal' })
+}
+
+test('lid off at session start never runs the check', async ($, on) => {
+  const h = harness(on)
+  await start($)
+  expect(h.checks()).toBe(0)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  expect(h.running()).toEqual(['caffeinate -i'])
+  expect(h.checks()).toBe(0)
+})
+
+test('with lid on, the command runs through hold.sh and the session start checks the helper', async ($, on) => {
+  const h = harness(on, { settings: { mode: 'session', lid: true } })
+  h.lid.check = 1
+  await start($)
+  expect(h.checks()).toBe(1)
+  expect(h.children[0]!.argv.slice(0, 2)[0]).toBe('/bin/sh')
+  expect(h.children[0]!.argv.slice(2)).toEqual(['caffeinate', '-i'])
+  expect(h.children[0]!.argv[1]!.endsWith('/lid/hold.sh')).toBe(true)
+  // The helper is missing: the hold carries on, with a note
+  expect(h.status()).toBe('☕ keeping awake: for the session (lid helper not installed: /caffeinate)')
+  expect(h.admins()).toBe(0)
+})
+
+test('enabling the lid with the helper installed saves without an admin prompt', async ($, on) => {
+  const h = harness(on, {}, false)
+  h.lid.check = 0
+  const ui = await lidPane($)
+  await ui.select({ key: 'lid', value: 'on' })
+  await settle()
+  expect((h.store.get('settings') as any).lid).toBe(true)
+  expect(h.admins()).toBe(0)
+  expect(await ui.find({ type: 'Button', label: 'Uninstall lid helper' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('enabling the lid with the helper missing asks for admin once, and saves on success', async ($, on) => {
+  const h = harness(on, {}, false)
+  const ui = await lidPane($)
+  await ui.select({ key: 'lid', value: 'on' })
+  await settle()
+  expect(h.admins()).toBe(1)
+  const osa = h.runs.find((r) => r[0] === '/usr/bin/osascript')!
+  expect(osa[osa.length - 2]!.endsWith('/lid/install.sh')).toBe(true)
+  expect(osa[osa.length - 1]).toBe('bruno')
+  expect((h.store.get('settings') as any).lid).toBe(true)
+
+  // Off leaves the helper installed and idle; on again does not ask again
+  await ui.select({ key: 'lid', value: 'off' })
+  await settle()
+  expect((h.store.get('settings') as any).lid).toBe(false)
+  await ui.select({ key: 'lid', value: 'on' })
+  await settle()
+  expect((h.store.get('settings') as any).lid).toBe(true)
+  expect(h.admins()).toBe(1)
+  await ui.unmount()
+})
+
+test('cancelling the admin prompt leaves the lid off and says so', async ($, on) => {
+  const h = harness(on, {}, false)
+  h.lid.admin = { exitCode: 1, stderr: '0:100: execution error: User canceled. (-128)\n' }
+  const ui = await lidPane($)
+  await ui.select({ key: 'lid', value: 'on' })
+  await settle()
+  expect(h.admins()).toBe(1)
+  expect((h.store.get('settings') as any)?.lid ?? false).toBe(false)
+  expect(await ui.find({ type: 'Text', text: 'Could not install the lid helper: cancelled' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('uninstalling the lid helper runs the admin script and turns the lid off', async ($, on) => {
+  const h = harness(on, { settings: { lid: true } }, false)
+  h.lid.check = 0
+  const ui = await lidPane($)
+  await ui.press({ key: 'lid-uninstall' })
+  await settle()
+  const osa = h.runs.find((r) => r[0] === '/usr/bin/osascript')!
+  expect(osa[osa.length - 2]!.endsWith('/lid/uninstall.sh')).toBe(true)
+  expect((h.store.get('settings') as any).lid).toBe(false)
+  await ui.unmount()
 })
